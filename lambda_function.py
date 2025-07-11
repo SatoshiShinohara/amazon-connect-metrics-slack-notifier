@@ -49,8 +49,8 @@ def lambda_handler(event, context):
         
         # メトリクスの取得
         metrics_to_collect = [
-            'CONTACTS_HANDLED',
-            'CONTACTS_HANDLED_BY_CONNECTED_TO_AGENT',
+            'CONTACTS_CREATED',          # 着信コンタクト（INBOUND フィルター付き）
+            'CONTACTS_HANDLED',          # 対応した着信コンタクト（INBOUND フィルター付き）
             'AVG_QUEUE_ANSWER_TIME',
             'SERVICE_LEVEL'
         ]
@@ -137,12 +137,40 @@ def collect_metric(connect, connect_arn, queues, time_range, metric_name, result
     
     # SERVICE_LEVEL の場合はしきい値を設定
     if metric_name == 'SERVICE_LEVEL':
-        metric_config['Threshold'] = [
-            {
-                'Comparison': 'LTE',
-                'ThresholdValue': SERVICE_LEVEL_THRESHOLD
-            }
-        ]
+        metric_config = {
+            'Name': metric_name,
+            'Threshold': [
+                {
+                    'Comparison': 'LTE',
+                    'ThresholdValue': SERVICE_LEVEL_THRESHOLD
+                }
+            ]
+        }
+        logger.info(f"メトリクス {metric_name} に SERVICE_LEVEL_THRESHOLD を適用しました")
+    
+    # フィルターの設定
+    filters = [
+        {
+            'FilterKey': 'QUEUE',
+            'FilterValues': queues
+        }
+    ]
+    
+    # CONTACTS_CREATED と CONTACTS_HANDLED の場合は INBOUND フィルターを追加
+    if metric_name in ['CONTACTS_CREATED', 'CONTACTS_HANDLED']:
+        metric_config = {
+            'Name': metric_name,
+            'MetricFilters': [
+                {
+                    'MetricFilterKey': 'INITIATION_METHOD',
+                    'MetricFilterValues': [
+                        'INBOUND',
+                    ],
+                    'Negate': False
+                }
+            ],
+        }
+        logger.info(f"メトリクス {metric_name} に INBOUND フィルターを適用しました")
     
     try:
         response = connect.get_metric_data_v2(
@@ -152,12 +180,7 @@ def collect_metric(connect, connect_arn, queues, time_range, metric_name, result
             Interval={
                 'IntervalPeriod': 'TOTAL'
             },
-            Filters=[
-                {
-                    'FilterKey': 'QUEUE',
-                    'FilterValues': queues
-                },
-            ],
+            Filters=filters,
             Groupings=['QUEUE'],
             Metrics=[metric_config]
         )
@@ -205,17 +228,12 @@ def process_metric_results(response, metric_name, results):
             value += collection_value
             total_value += collection_value
             total_count += 1
-        
-        # AVG_QUEUE_ANSWER_TIME の場合は平均を計算
-        if metric_name == 'AVG_QUEUE_ANSWER_TIME' and collections:
-            value = value / len(collections) if len(collections) > 0 else 0
-        
-        if queue in results:
-            results[queue].append({metric_name: value})
-    
-    # 合計値の計算
-    if metric_name == 'AVG_QUEUE_ANSWER_TIME' and total_count > 0:
-        total_value = total_value / total_count
+       
+    if (metric_name == 'AVG_QUEUE_ANSWER_TIME' or metric_name == 'SERVICE_LEVEL'):
+        if total_count > 0:
+            total_value = round(total_value / total_count, 2)
+        else:
+            total_value = 0
     
     results['total'].append({metric_name: total_value})
 
@@ -228,35 +246,43 @@ def calculate_summary(results):
     total_info = results.get('total', [])
     
     # 必要なメトリクスの取得
-    contacts_handled = 0
-    contacts_handled_by_agent = 0
-    avg_queue_answer_time = 0
-    service_level = 0
+    contacts_created = 0      # 着信コンタクト数
+    contacts_handled = 0      # 対応した着信コンタクト数
+    avg_queue_answer_time = 0 # 対応時間の平均秒数
+    service_level = 0         # 20 秒以下に対応した%
+    service_level_count = 0   # 20 秒以下で対応した件数
     
     for item in total_info:
-        if 'CONTACTS_HANDLED' in item:
+        if 'CONTACTS_CREATED' in item:
+            contacts_created = float(item['CONTACTS_CREATED'])
+        elif 'CONTACTS_HANDLED' in item:
             contacts_handled = float(item['CONTACTS_HANDLED'])
-        elif 'CONTACTS_HANDLED_BY_CONNECTED_TO_AGENT' in item:
-            contacts_handled_by_agent = float(item['CONTACTS_HANDLED_BY_CONNECTED_TO_AGENT'])
         elif 'AVG_QUEUE_ANSWER_TIME' in item:
             avg_queue_answer_time = float(item['AVG_QUEUE_ANSWER_TIME'])
         elif 'SERVICE_LEVEL' in item:
             service_level = float(item['SERVICE_LEVEL'])
+            service_level_count = contacts_created * service_level / 100
     
     # 受話率の計算（エージェント接続率）
     answer_rate = 0
-    if contacts_handled > 0:
-        answer_rate = round((contacts_handled_by_agent / contacts_handled) * 100, 2)
+    if contacts_created > 0:
+        answer_rate = round((contacts_handled / contacts_created) * 100, 2)
     else:
         # 着信が0件の場合は受話率を0%または100%とする（ビジネスルールによる）
         # 着信がない場合は100%とするのが一般的だが、要件に応じて変更可能
         answer_rate = 0  # または 100
         logger.info("着信が0件のため、受話率を0%に設定します")
     
+    # デバッグ用ログ
+    logger.info(f"メトリクスの詳細: 着信={contacts_created}, 対応={contacts_handled}, 受話率={answer_rate}%")
+    
     return {
         'answer_rate': answer_rate,
         'service_level': round(service_level, 2) if service_level is not None else 0,
-        'avg_queue_answer_time': round(avg_queue_answer_time, 2) if avg_queue_answer_time is not None else 0
+        'service_level_count': round(service_level_count) if service_level_count is not None else 0,
+        'avg_queue_answer_time': round(avg_queue_answer_time, 2) if avg_queue_answer_time is not None else 0,
+        'contacts_created': contacts_created,
+        'contacts_handled': contacts_handled
     }
 
 
@@ -270,12 +296,12 @@ def send_slack_notification(webhook_url, time_range, summary):
     
     # 着信が0件の場合の特別メッセージ
     if summary["answer_rate"] == 0 and summary["service_level"] == 0 and summary["avg_queue_answer_time"] == 0:
-        message = f'<!here>\n{start_time_jst.strftime("%H:%M")}~{end_time_jst.strftime("%H:%M")}の直前1時間は着信が0件でした。\n'
+        message = f'<!here>\n{start_time_jst.strftime("%H:%M")}~{end_time_jst.strftime("%H:%M")}は着信が0件でした。\n'
     else:
-        message = f'<!here>\n{start_time_jst.strftime("%H:%M")}~{end_time_jst.strftime("%H:%M")}の直前1時間の受電状況は以下の通りです。\n'
-        message += f'受話率 : {summary["answer_rate"]}%\n'
-        message += f'SVL : {summary["service_level"]}%\n'
-        message += f'ASA : {summary["avg_queue_answer_time"]}秒\n'
+        message = f'<!here>\n{start_time_jst.strftime("%H:%M")}~{end_time_jst.strftime("%H:%M")}の受電状況は以下のとおりです。\n'
+        message += f'・受話率：{int(summary["contacts_handled"])}件/{int(summary["contacts_created"])}件（{summary["answer_rate"]}%）\n'
+        message += f'・SVL：{int(summary["service_level_count"])}件/{int(summary["contacts_created"])}件（{summary["service_level"]}%）\n'
+        message += f'・ASA：{summary["avg_queue_answer_time"]}秒\n'
     
     logger.info(f"Slack通知メッセージ: {message}")
     
